@@ -1,0 +1,8 @@
+{
+  "robot_name": "Giya",
+  "welcome_speech": "Hello, I am Giya, your robot assistant",
+  "language": "en",
+  "voice": "female",
+  "chatgpt_enabled": false,
+  "chatgpt_expires": ""
+}
