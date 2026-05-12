@@ -462,7 +462,7 @@ def handle_save_pose():
 def handle_eyes():
     eye = request.path[-1]
     print(f"[SIGNAL] EYES: {eye}")
-    send_to_mega(f"EYES:{eye}")
+    send_to_esp32(f"EYES:{eye}")
     return "OK", 200
 
 @app.route('/mode1', methods=['GET'])
