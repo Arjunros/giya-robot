@@ -4,7 +4,8 @@ from face_utils import register_face, list_faces, delete_face
 from werkzeug.utils import secure_filename
 from settings import load_settings, save_settings
 from flask_cors import CORS
-import os, threading, serial, serial.tools.list_ports, json, time, subprocess
+import os, threading, serial, serial.tools.list_ports, json, time
+import subprocess
 
 # ── Pose Storage ───────────────────────────────────────────
 POSES_FILE = "poses.json"
@@ -33,7 +34,8 @@ try:
 except Exception as e:
     print(f"[WARNING] Face model init failed: {e}")
 
-# ── ESP32 Serial ───────────────────────────────────────────
+# ── ESP32 Serial (Base movement only) ─────────────────────
+# Fixed port via udev rule: /dev/ttyAMA0 → CP2102 (10c4:ea60)
 try:
     esp32 = serial.Serial('/dev/ttyAMA0', 115200, timeout=1)
     print(f"[ESP32] Connected on /dev/ttyAMA0")
@@ -65,7 +67,6 @@ def send_to_esp32(command: str):
     except Exception as e:
         print(f"[ESP32] Error: {e}")
         reconnect_esp32()
-
 # ── Speak Welcome ──────────────────────────────────────────
 def speak_welcome():
     from audio_utils import speak
@@ -82,44 +83,11 @@ def speak_welcome():
         from eyes import set_state
         set_state("idle")
     except: pass
+    # Resume movement after speaking
     send_to_esp32("RESUME")
     print("[ESP32] Resume sent after welcome")
 
-# ── Shared Shutdown ────────────────────────────────────────
-def do_shutdown():
-    print("[SHUTDOWN] Step 1 - starting")
-    try:
-        from eyes import set_state
-        set_state("obstacle")
-    except: pass
-    print("[SHUTDOWN] Step 2 - stopping motors")
-    try:
-        send_to_esp32("MOVE:stop")
-        time.sleep(1)
-    except: pass
-    print("[SHUTDOWN] Step 3 - homing")
-    try:
-        send_to_esp32("HOME")
-        time.sleep(2)
-    except: pass
-    print("[SHUTDOWN] Step 4 - playing audio")
-    try:
-        shutdown_wav = "/home/ben/pi_assistant/shutdown.wav"
-        if os.path.exists(shutdown_wav):
-            subprocess.run(['aplay', '-D', 'plughw:2,0', shutdown_wav],
-                          timeout=5, capture_output=True)
-        print("[SHUTDOWN] Step 4 done - audio played")
-    except: pass
-    print("[SHUTDOWN] Step 5 - sending LATCH:OFF")
-    send_to_esp32("LATCH:OFF")
-    print("[SHUTDOWN] Step 6 - scheduling poweroff")
-    subprocess.Popen(["bash", "-c", "sleep 2 && sudo /sbin/shutdown -h now"])
-    print("[SHUTDOWN] Step 7 - exiting cleanly")
-    os._exit(0)
-
 # ── ESP32 Reader ───────────────────────────────────────────
-hardware_enabled = True
-
 def esp32_reader():
     print("[ESP32] Starting reader thread")
     last_data = time.time()
@@ -156,14 +124,30 @@ def esp32_reader():
                             set_state("forward")
                         except: pass
 
-                    # ── BUTTON SHUTDOWN FROM ESP32 ─────────────
+                    # ── BUTTON SHUTDOWN FROM ESP32 ────────────────
                     elif line.startswith("SHUTDOWN"):
                         print("[ESP32] Button shutdown received!")
-                        threading.Thread(target=do_shutdown, daemon=True).start()
+                        def do_btn_shutdown():
+                            try:
+                                from eyes import set_state
+                                set_state("obstacle")
+                            except: pass
+                            try:
+                                from audio_utils import speak
+                                speak("Shutting down")
+                            except: pass
+                            send_to_esp32("HOME")
+                            time.sleep(2)
+                            try:
+                                from eyes import stop_eyes
+                                stop_eyes()
+                            except: pass
+                            import subprocess
+                            subprocess.run(['sudo', 'shutdown', '-h', 'now'])
+                        threading.Thread(target=do_btn_shutdown, daemon=True).start()
 
                     elif any(x in line for x in ["ready","READY","Giya","BLOCKED","LATCH","HW:"]):
                         print(f"[ESP32] {line}")
-
                 if time.time() - last_data > 120:
                     print("[ESP32] No data 120s — reconnecting...")
                     reconnect_esp32()
@@ -176,8 +160,8 @@ def esp32_reader():
 
 esp32_reader_thread = threading.Thread(target=esp32_reader, daemon=True)
 esp32_reader_thread.start()
-
-# ── Mega Serial ────────────────────────────────────────────
+# ── Mega Serial (Arm/Head servos) ─────────────────────────
+# Fixed port via udev rule: /dev/mega → CH340 (1a86:7523)
 try:
     mega = serial.Serial('/dev/mega', 9600, timeout=1)
     print(f"[MEGA] Connected on /dev/mega")
@@ -249,7 +233,7 @@ def ping():
 def status():
     return jsonify({"battery": 100, "wifi": True, "connected": True}), 200
 
-# ── Q&A ────────────────────────────────────────────────────
+# ── Q&A ───────────────────────────────────────────────────
 @app.route('/qa/add', methods=['POST'])
 def add():
     try:
@@ -321,7 +305,7 @@ def test_voice():
         threading.Thread(target=speak, args=("Hello, I am your Pi assistant",)).start()
     return jsonify({"status": "ok"})
 
-# ── Face ───────────────────────────────────────────────────
+# ── Face ──────────────────────────────────────────────────
 @app.route('/face/add', methods=['POST'])
 def face_add():
     try:
@@ -382,7 +366,7 @@ def handle_upload_face():
         print(f"[FACE] Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ── Settings ───────────────────────────────────────────────
+# ── Settings ──────────────────────────────────────────────
 @app.route('/settings', methods=['GET'])
 def get_settings():
     return jsonify(load_settings())
@@ -408,7 +392,7 @@ def set_apikey():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ── Save Audio ─────────────────────────────────────────────
+# ── TechnoBot Audio ───────────────────────────────────────
 @app.route('/save-audio', methods=['POST'])
 def save_audio():
     try:
@@ -432,17 +416,18 @@ def save_audio():
         print(f"[TECHNOBOT] Error: {e}")
         return jsonify({"error": str(e)}), 400
 
-# ── Hardware Toggle ────────────────────────────────────────
+# -- Hardware toggle ----------------------------------------
+hardware_enabled = True
+
 @app.route('/hardware', methods=['GET'])
 def handle_hardware():
     global hardware_enabled
     state = request.args.get('state', 'on')
     hardware_enabled = (state == 'on')
     print(f"[HARDWARE] {'Enabled' if hardware_enabled else 'Disabled'}")
+    # Tell ESP32 to enable/disable TF-Luna obstacle+person detection
     send_to_esp32(f"HARDWARE:{'ON' if hardware_enabled else 'OFF'}")
     return jsonify({"status": "ok", "hardware": hardware_enabled}), 200
-
-# ── Movement ───────────────────────────────────────────────
 @app.route('/move', methods=['GET'])
 def handle_move():
     direction = request.args.get('dir', 'stop')
@@ -464,7 +449,7 @@ def handle_topspeed():
     send_to_esp32(f"TOPSPEED:{value}")
     return "OK", 200
 
-# ── Position ───────────────────────────────────────────────
+# ── Arm/Head → Mega only ──────────────────────────────────
 @app.route('/position', methods=['GET'])
 def handle_position():
     part  = request.args.get('part', '')
@@ -483,7 +468,7 @@ def handle_hand():
 
 @app.route('/home', methods=['GET'])
 def handle_home():
-    print("[SIGNAL] HOME")
+    print("[SIGNAL] HOME: Reset")
     send_to_esp32("HOME")
     return "OK", 200
 
@@ -504,7 +489,6 @@ def handle_save_pose():
     send_to_esp32(f"SAVE_POSE:{pos}")
     return "OK", 200
 
-# ── Eyes ───────────────────────────────────────────────────
 @app.route('/eyes1', methods=['GET'])
 @app.route('/eyes2', methods=['GET'])
 @app.route('/eyes3', methods=['GET'])
@@ -529,7 +513,6 @@ def handle_mode():
     send_to_esp32(f"MODE:{mode}:{value}")
     return "OK", 200
 
-# ── Loop ───────────────────────────────────────────────────
 @app.route('/loop_start', methods=['GET'])
 def handle_loop_start():
     global loop_running, loop_thread
@@ -573,28 +556,36 @@ def handle_select_model():
     print(f"[SIGNAL] MODEL: {name}")
     send_to_esp32(f"MODEL:{name}")
     return "OK", 200
-
-# ── Shutdown ───────────────────────────────────────────────
 @app.route('/shutdown', methods=['GET'])
 def handle_shutdown():
-    threading.Thread(target=do_shutdown, daemon=True).start()
-    return jsonify({"status": "ok", "message": "Shutting down..."}), 200
-
-@app.route('/restart', methods=['GET'])
-def handle_restart():
-    def do_restart():
+    def do_shutdown():
         try:
             from eyes import set_state
             set_state("obstacle")
         except: pass
+        send_to_esp32("MOVE:stop")
+        time.sleep(1)
         send_to_esp32("HOME")
-        time.sleep(5)
-        subprocess.Popen(["bash", "-c", "sleep 2 && sudo /sbin/reboot"])
-        os._exit(0)
-    threading.Thread(target=do_restart, daemon=True).start()
-    return jsonify({"status": "ok", "message": "Restarting..."}), 200
+        time.sleep(2)
+        try:
+            from audio_utils import speak
+            speak("Shutting down")
+        except: pass
+        time.sleep(1)
+        try:
+            from eyes import stop_eyes
+            stop_eyes()
+        except: pass
+        # Tell ESP32 to start its 15s power-cut countdown
+        send_to_esp32("LATCH:OFF")
+        print("[SHUTDOWN] LATCH:OFF sent ESP32 cuts power in 15s")
+        time.sleep(1)
+        import subprocess
+        subprocess.run(['sudo', 'shutdown', '-h', 'now'])
+    threading.Thread(target=do_shutdown, daemon=True).start()
+    return jsonify({"status": "ok", "message": "Shutting down..."}), 200
 
-# ── Start ──────────────────────────────────────────────────
+# ── Start ─────────────────────────────────────────────────
 def start_server():
     app.run(host='0.0.0.0', port=5000, debug=False)
 

@@ -34,7 +34,7 @@
 // ──────────────────────────────────────────────────────────
 // SERVO PINS
 // ──────────────────────────────────────────────────────────
-#define SERVO_L_PIN  32   // Left forearm
+#define SERVO_L_PIN  14   // Left forearm
 #define SERVO_R_PIN  27   // Right forearm
 
 // ──────────────────────────────────────────────────────────
@@ -50,9 +50,9 @@
 // ──────────────────────────────────────────────────────────
 // SERVO SETTINGS
 // ──────────────────────────────────────────────────────────
-#define SERVO_MIN    0
-#define SERVO_MAX    180
-#define SERVO_CENTER 90
+#define SERVO_MIN    180
+#define SERVO_MAX    90
+#define SERVO_CENTER 180
 
 // ──────────────────────────────────────────────────────────
 // UART TO RASPBERRY PI
@@ -285,7 +285,7 @@ void handleSerial() {
   int value   = cmd.substring(p1 + 1, p2).toInt();
   String hand = cmd.substring(p2 + 1);
 
-  if (part == "forearm") {
+  if (part == "elbow") {
     moveServos(value, hand.c_str());
   } else {
     Serial.print("[IGNORE] Unknown part: ");

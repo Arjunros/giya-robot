@@ -81,25 +81,55 @@ def speak(text: str):
         'female': '/home/ben/pi_assistant/voices/en_US-amy-medium.onnx',
         'male':   '/home/ben/pi_assistant/voices/en_US-ryan-medium.onnx',
     }
-    model = voice_map.get(voice, voice_map['female'])
-    speaker_card = get_speaker_card()
-    print(f"[TTS] Speaking on hw:{speaker_card},0")
+    model    = voice_map.get(voice, voice_map['female'])
+    spk_card = get_speaker_card()
+    print(f"[TTS] Speaking on plughw:{spk_card},0")
     try:
-        # Piper raw 22050Hz mono 16-bit
-        # â†’ sox converts to 44100Hz stereo S16_LE
-        # â†’ aplay sends to USB speaker
-        piper_cmd = f'echo "{text}" | piper --model {model} --output_raw'
-        play_cmd  = (
-            f'sox -t raw -r 22050 -e signed-integer -b 16 -c 1 - '
-            f'-t wav -r 44100 -e signed-integer -b 16 -c 2 - | '
-            f'aplay -D hw:{speaker_card},0'
-        )
-        result = subprocess.run(
-            f'{piper_cmd} | {play_cmd}',
-            shell=True,
-            capture_output=True
-        )
+        # Step 1 — piper generates raw audio to file
+        raw_path = '/tmp/tts_raw.pcm'
+        wav_path = '/tmp/tts_out.wav'
+
+        # Generate raw audio from piper
+        piper_cmd = [
+            'bash', '-c',
+            f'echo "{text}" | piper --model {model} --output_raw > {raw_path}'
+        ]
+        import subprocess
+        result = subprocess.run(piper_cmd, capture_output=True)
         if result.returncode != 0:
-            print(f"[TTS] Error: {result.stderr.decode()}")
+            print(f"[TTS] Piper error: {result.stderr.decode()}")
+            return
+
+        # Step 2 — convert raw to wav file (no streaming — avoids header issue)
+        sox_cmd = [
+            'sox',
+            '-t', 'raw',
+            '-r', '22050',
+            '-e', 'signed-integer',
+            '-b', '16',
+            '-c', '1',
+            raw_path,
+            '-r', '44100',
+            '-e', 'signed-integer',
+            '-b', '16',
+            '-c', '2',
+            wav_path
+        ]
+        result = subprocess.run(sox_cmd, capture_output=True)
+        if result.returncode != 0:
+            print(f"[TTS] Sox error: {result.stderr.decode()}")
+            return
+
+        # Step 3 — play wav file (re-detect card in case it changed)
+        spk_card = get_speaker_card()
+        play_cmd = [
+            'aplay',
+            '-D', f'plughw:{spk_card},0',
+            wav_path
+        ]
+        result = subprocess.run(play_cmd, capture_output=True)
+        if result.returncode != 0:
+            print(f"[TTS] aplay error: {result.stderr.decode()}")
+
     except Exception as e:
         print(f"[TTS] Error: {e}")
