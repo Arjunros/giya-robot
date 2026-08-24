@@ -104,18 +104,37 @@ def do_shutdown():
     except: pass
     print("[SHUTDOWN] Step 4 - playing audio")
     try:
-        shutdown_wav = "/home/ben/pi_assistant/shutdown.wav"
+        shutdown_wav = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "shutdown.wav")
         if os.path.exists(shutdown_wav):
-            subprocess.run(['aplay', '-D', 'plughw:2,0', shutdown_wav],
-                          timeout=5, capture_output=True)
+            # Was hardcoded to plughw:2,0. The speaker is on card 3 on this
+            # robot, and card numbers shuffle between boots anyway  so the
+            # goodbye was playing into whatever happened to be card 2.
+            from audio_utils import get_speaker_device
+            subprocess.run(['aplay', '-q', '-D', get_speaker_device(),
+                            shutdown_wav], timeout=8, capture_output=True)
         print("[SHUTDOWN] Step 4 done - audio played")
-    except: pass
+    except Exception as e:
+        print(f"[SHUTDOWN] Step 4 error: {e}")
     print("[SHUTDOWN] Step 5 - sending LATCH:OFF")
     send_to_esp32("LATCH:OFF")
-    print("[SHUTDOWN] Step 6 - scheduling poweroff")
-    subprocess.Popen(["bash", "-c", "sleep 2 && sudo /sbin/shutdown -h now"])
-    print("[SHUTDOWN] Step 7 - exiting cleanly")
-    os._exit(0)
+
+    # Step 6: call shutdown DIRECTLY.
+    #
+    # The old version did:
+    #     subprocess.Popen(["bash","-c","sleep 2 && sudo /sbin/shutdown -h now"])
+    #     os._exit(0)
+    # which looks safer but is not. os._exit kills this process, systemd then
+    # tears down the whole cgroup by default, and the "sleep 2" child dies
+    # before it ever runs. The journal showed the result: "Deactivated
+    # successfully" followed by "Scheduled restart job"  the service just
+    # came back while the ESP32 cut power 15 seconds later on a running
+    # machine. That is an unclean power-off on every button press.
+    #
+    # `shutdown -h now` hands off to systemd and returns immediately, so this
+    # does not block either.
+    print("[SHUTDOWN] Step 6 - poweroff")
+    subprocess.run(["sudo", "/sbin/shutdown", "-h", "now"])
 
 # ── ESP32 Reader ───────────────────────────────────────────
 hardware_enabled = True
