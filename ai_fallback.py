@@ -3,7 +3,7 @@ from settings import load_settings
 import json, os
 
 def get_client():
-    key = "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"   # ← your API key here
+    key = ""   # ← your API key here
     return OpenAI(api_key=key)
 
 def ask_gpt(question: str, language: str = "en") -> str:
