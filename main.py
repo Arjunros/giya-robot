@@ -1,4 +1,4 @@
-import time, os, threading, struct, subprocess
+import time, os, threading, struct, subprocess, re
 from server import start_server, send_to_esp32
 from audio_utils import record_audio, speak
 from qa_store import find_answer, save_qa
@@ -24,36 +24,70 @@ FACTORY_WIFI_SSID  = "GiyaRobot"
 FACTORY_WIFI_PASS  = "giya1234"
 FACTORY_IP         = "192.168.4.1"
 
-# ── Wake word variants ─────────────────────────────────────
-# NOTE: "yeah" and "ga" were in this list and are removed. Both appear in
-# ordinary speech constantly, so Giya would drop into Q&A mode whenever anyone
-# nearby said "yeah" — and because matching is a plain substring test, "ga"
-# also fires on "again", "garden", "regard" and hundreds of others.
+# ══════════════════════════════════════════════════════════════════════
+# WAKE WORD
+#
+# Whisper does not know the word "Giya" exists, so it reaches for the nearest
+# English word it does know. The journal shows the spread: 'gia' one time,
+# 'yeah' another. The real fix is the initial_prompt in whisper_worker.py,
+# which puts the name in the decoder's hypothesis space; this list is the
+# safety net under it.
+#
+# TWO TIERS, deliberately:
+#
+#   WAKE_WORDS        matched anywhere in the utterance, on word boundaries.
+#   WAKE_WORDS_ALONE  matched ONLY when it is the entire utterance.
+#
+# The second tier exists because the most common mistranscriptions of "Giya"
+# are also ordinary English words. "yeah" inside a sentence is somebody in the
+# room agreeing with something, not a summons — putting it in the first tier
+# would have Giya interrupt every conversation held near her. As the whole
+# utterance, after a 3-second recording, it is almost certainly aimed at her.
+#
+# "ga" is in NEITHER list. Matching is by word boundary now, but "ga" is still
+# a real word-sized fragment in plenty of speech, and it was firing on
+# "again", "garden" and "regard" back when matching was a bare substring test.
+# ══════════════════════════════════════════════════════════════════════
 WAKE_WORDS = [
     "giya", "geya", "gia", "gya", "gea", "giyah", "guia",
     "jiya", "jia", "jeya",
     "hey giya", "hi giya", "ok giya", "okay giya",
-    "giya please", "please giya", "dear giya","yeah",
+    "giya please", "please giya", "dear giya",
 ]
+
+WAKE_WORDS_ALONE = {"yeah", "yea", "ya", "yah", "gear", "kia", "hiya", "gaya"}
 
 # Word-boundary matching. The old version used `w in text`, so a single-syllable
 # variant like "gia" matched inside "Nigeria" or "logical". Requiring whole
 # words removes a whole class of false triggers at no cost.
-import re
 _WAKE_RE = re.compile(
     r'\b(' + '|'.join(re.escape(w) for w in sorted(WAKE_WORDS, key=len,
                                                    reverse=True)) + r')\b')
 
 
 def is_wake_word(text: str) -> bool:
-    return bool(_WAKE_RE.search((text or "").lower().strip()))
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    if _WAKE_RE.search(t):
+        return True
+    # Single-word utterances only — see the note above.
+    words = re.findall(r"[a-z]+", t)
+    return len(words) == 1 and words[0] in WAKE_WORDS_ALONE
 
 
 # Whisper's stock inventions on silence. Without this, "you" or "thank you"
 # from an empty room reaches the "hi" branch below and Giya announces
 # "Please look at the camera" to nobody.
+#
+# "yeah" is NOT in this set any more. It was in both this set and the wake
+# list, and is_noise() ran FIRST in the listening loop — so a bare "yeah" was
+# discarded as a hallucination before the wake check ever saw it, and never
+# appeared in the journal at all. That is why 'gia' woke her and 'yeah' never
+# did. The loop below now checks the wake word first, which is the ordering
+# this set always assumed.
 _NOISE = {"", ".", "you", "thank you", "thanks", "okay", "ok", "oh", "hmm",
-          "uh", "um", "bye", "hello", "hi", "yeah", "so", "the",
+          "uh", "um", "bye", "hello", "hi", "so", "the",
           "thanks for watching", "subs by", "subscribe"}
 
 
@@ -94,22 +128,18 @@ def set_eye(state):
 # unusable — and a crash would now be visible in the log rather than silent.
 # ══════════════════════════════════════════════════════════════════════
 
-WHISPER_MODEL = "base.en"      # "tiny" also works and is faster, less accurate
-_whisper = None
-_whisper_lock = threading.Lock()
-
-
-def _get_whisper():
-    global _whisper
-    with _whisper_lock:
-        if _whisper is None:
-            from faster_whisper import WhisperModel
-            print(f"[STT] loading {WHISPER_MODEL}...")
-            t0 = time.time()
-            _whisper = WhisperModel(WHISPER_MODEL, device="cpu",
-                                    compute_type="int8")
-            print(f"[STT] ready in {time.time()-t0:.1f}s")
-        return _whisper
+# The model lives in a SEPARATE, LONG-LIVED process — see whisper_worker.py.
+#
+# This robot segfaults inside faster-whisper: SIGSEGV in native code, which no
+# try/except can catch. The original code forked a child per utterance and so
+# never saw it — the child crashed, the parent got "" back, and the symptom
+# was "[STT] Heard: ''" every time with a 15-second delay. Those were one
+# cause: the delay was the model reloading on each fork, the empty results
+# were the crash.
+#
+# Neither of the obvious structures works. Fork-per-utterance isolates the
+# crash but reloads the model constantly; running in-process keeps the model
+# warm but one crash kills the service. A persistent worker does both.
 
 
 def transcribe(wav_path: str) -> str:
@@ -119,31 +149,8 @@ def transcribe(wav_path: str) -> str:
         try: os.remove(wav_path)
         except: pass
         return ""
-    try:
-        t0 = time.time()
-        segments, _ = _get_whisper().transcribe(
-            wav_path,
-            language="en",
-            beam_size=1,                       # greedy: faster, ample here
-            vad_filter=True,                   # skip silence: quicker, and
-            condition_on_previous_text=False,  # stops repetition loops
-        )
-        text = " ".join(s.text for s in segments).lower().strip()
-        for ch in ".,!?":
-            text = text.replace(ch, "")
-        text = " ".join(text.split())
-        print(f"[STT] {time.time()-t0:.1f}s -> {text!r}")
-        return text
-    except Exception as e:
-        # Say WHY nothing came back. Returning "" for both "heard silence" and
-        # "the model failed" is what made this so slow to diagnose.
-        import traceback
-        print(f"[STT] error: {e}")
-        traceback.print_exc()
-        return ""
-    finally:
-        try: os.remove(wav_path)
-        except: pass
+    from whisper_worker import transcribe as _t
+    return _t(wav_path)
 
 
 # ── Q&A mode ───────────────────────────────────────────────
@@ -224,6 +231,12 @@ def do_shutdown():
     except Exception as e:
         print(f"[SHUTDOWN] Latch error: {e}")
 
+    try:
+        import whisper_worker
+        whisper_worker.stop()
+    except Exception:
+        pass
+
     print("[SHUTDOWN] Executing poweroff")
     # Call shutdown DIRECTLY.
     #
@@ -256,6 +269,7 @@ def do_factory_reset():
         "welcome_speech":  f"Hello, I am {FACTORY_ROBOT_NAME}, your robot assistant",
         "language":        "en",
         "voice":           "female",
+        "volume":          80,
         "chatgpt_enabled": True
     })
     print("[FACTORY] settings.json reset")
@@ -441,15 +455,21 @@ def joystick_loop():
 
 # ── Voice listening loop ───────────────────────────────────
 def listening_loop():
+    # Start the speech worker BEFORE the first recording, so the load time is
+    # not paid on top of the first utterance — the very first thing anybody
+    # says to the robot is otherwise the one thing it misses.
+    try:
+        import whisper_worker
+        whisper_worker.start()
+    except Exception as e:
+        print(f"[STT] worker could not start: {e}")
+
     print("[MAIN] Giya ready. Listening for wake word...")
     set_eye("speaking")
     speak("Hello, I am Giya, your robot assistant.")
     set_eye("idle")
 
-    # Load Whisper BEFORE the first recording. Otherwise the first utterance
-    # of the session pays the model-load time on top of transcription, and the
-    # very first thing anyone says to the robot is the one thing it misses.
-    _get_whisper()
+    # The speech worker was already started above, so the model is warm.
 
     while True:
         if shutdown_in_progress:
@@ -475,15 +495,27 @@ def listening_loop():
         if shutdown_in_progress:
             break
 
-        if not text or is_noise(text):
+        if not text:
             time.sleep(0.1)
             continue
 
+        # Log EVERYTHING that came back, including what will be discarded as
+        # noise a moment later. This is how you find out what Whisper actually
+        # produces when somebody says "Giya" — grep the journal for [STT] and
+        # add the real variants to WAKE_WORDS rather than guessing at them.
         print(f"[STT] Heard: {text!r}")
 
+        # The wake check runs FIRST, before is_noise(). Several plausible
+        # mistranscriptions of the name are also words Whisper hallucinates on
+        # silence, and whichever check runs first wins. Missing a wake word is
+        # the worse failure: the robot looks broken. A stray wake is one
+        # unnecessary "Yes?".
         if is_wake_word(text):
             print(f"[MAIN] Wake word detected in: {text!r}")
             qa_mode()
+        elif is_noise(text):
+            time.sleep(0.1)
+            continue
         elif re.search(r'\b(hi|hello)\s+giya\b', text) or "who am i" in text:
             # Was: `"hi" in text.split() or text.startswith("hi")`. Whisper
             # emits a bare "Hi." on silence, so face mode fired at random and

@@ -22,7 +22,7 @@ PIPER_BIN   = (shutil.which("piper")
 #
 # The dongle appears under `arecord -l` because the PCM2902 chip has a capture
 # side, with nothing plugged into it. The previous code's fallback matched the
-# bare keyword "USB", which would select it â€” and Giya would record silence
+# bare keyword "USB", which would select it â and Giya would record silence
 # while every log line looked healthy. It is blocked by USB ID below.
 #
 # THE FORMATS ARE NOT THE SAME, and this is the part that cannot be shared:
@@ -33,7 +33,7 @@ PIPER_BIN   = (shutil.which("piper")
 #            `remix 1` picks the single channel that actually carries the mic.
 #
 #   Lav      is an ordinary USB audio device. It gives 1-channel S16_LE
-#            directly and needs no conversion at all â€” asking it for S32_LE
+#            directly and needs no conversion at all â asking it for S32_LE
 #            stereo would simply fail.
 #
 # So each mic carries its own arecord arguments. Both paths finish at
