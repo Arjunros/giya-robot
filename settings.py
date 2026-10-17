@@ -3,9 +3,9 @@ import json, os
 SETTINGS_FILE = "settings.json"
 
 VOICES = {
-    "female": "/home/ben/pi_assistant/voices/en_US-amy-medium.onnx",
-    "male":   "/home/ben/pi_assistant/voices/en_US-ryan-medium.onnx",
-    "child":  "/home/ben/pi_assistant/voices/en_US-lessac-low.onnx",
+    "female": "/home/giya/pi_assistant/voices/en_US-amy-medium.onnx",
+    "male":   "/home/giya/pi_assistant/voices/en_US-ryan-medium.onnx",
+    "child":  "/home/giya/pi_assistant/voices/en_US-lessac-low.onnx",
 }
 
 DEFAULT = {

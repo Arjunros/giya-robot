@@ -1,6 +1,6 @@
 
 import sys
-sys.path.insert(0, "/home/ben/pi_assistant/venv/lib/python3.13/site-packages")
+sys.path.insert(0, "/home/giya/pi_assistant/venv/lib/python3.13/site-packages")
 import board
 import neopixel
 import threading
@@ -10,7 +10,7 @@ import math
 NUM_LEDS   = 9
 BRIGHTNESS = 0.3
 
-left_eye  = neopixel.NeoPixel(board.D24, NUM_LEDS, brightness=BRIGHTNESS, auto_write=False)
+left_eye  = neopixel.NeoPixel(board.D12, NUM_LEDS, brightness=BRIGHTNESS, auto_write=False)
 right_eye = neopixel.NeoPixel(board.D10, NUM_LEDS, brightness=BRIGHTNESS, auto_write=False)
 
 _state   = "idle"
