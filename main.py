@@ -1,6 +1,6 @@
-import time, os, threading, struct, subprocess, multiprocessing
+import time, os, threading, struct, subprocess, re, difflib
 from server import start_server, send_to_esp32
-from audio_utils import record_audio, speak
+from audio_utils import record_audio, speak, spoke_since
 from qa_store import find_answer, save_qa
 from face_utils import scan_face_from_camera
 
@@ -24,36 +24,121 @@ FACTORY_WIFI_SSID  = "GiyaRobot"
 FACTORY_WIFI_PASS  = "giya1234"
 FACTORY_IP         = "192.168.4.1"
 
-# ── Wake word variants ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# WAKE WORD
+#
+# Whisper does not know the word "Giya" exists, so it reaches for the nearest
+# English word it does know. The journal shows the spread: 'gia' one time,
+# 'yeah' another. The real fix is the initial_prompt in whisper_worker.py,
+# which puts the name in the decoder's hypothesis space; this list is the
+# safety net under it.
+#
+# TWO TIERS, deliberately:
+#
+#   WAKE_WORDS        matched anywhere in the utterance, on word boundaries.
+#   WAKE_WORDS_ALONE  matched ONLY when it is the entire utterance.
+#
+# The second tier exists because the most common mistranscriptions of "Giya"
+# are also ordinary English words. "yeah" inside a sentence is somebody in the
+# room agreeing with something, not a summons — putting it in the first tier
+# would have Giya interrupt every conversation held near her. As the whole
+# utterance, after a 3-second recording, it is almost certainly aimed at her.
+#
+# "ga" is in NEITHER list. Matching is by word boundary now, but "ga" is still
+# a real word-sized fragment in plenty of speech, and it was firing on
+# "again", "garden" and "regard" back when matching was a bare substring test.
+# ══════════════════════════════════════════════════════════════════════
 WAKE_WORDS = [
-    "giya",
-    "geya",
-    "gia",
-    "gya",
-    "gea",
-    "gear",
-    "giyah",
-    "guia",
-    "jiya",
-    "jia",
-    "jeya",
-    "hey giya",
-    "hi giya",
-    "ok giya",
-    "okay giya",
-    "giya please",
-    "please giya",
-    "dear giya",
-    "yeah",
-    "ga",
+    "giya", "geya", "gia", "gya", "gea", "giyah", "guia",
+    "jiya", "jia", "jeya", "gaia", "giyya", "geeya", "giyaa",
+    "hey giya", "hi giya", "ok giya", "okay giya",
+    "giya please", "please giya", "dear giya",
 ]
 
+WAKE_WORDS_ALONE = {"yeah", "yea", "ya", "yah", "gear", "kia", "kiya",
+                    "hiya", "gaya", "diya", "dia", "geer"}
+
+# ── Sound-alike matching ──────────────────────────────────────────────
+# Whisper spells the same "Giya" a dozen ways: giya, geeya, jiyah, guia,
+# giyya... Listing every one is a losing game, so any single word with the
+# SHAPE  g/j + i/e sound + optional y + a  counts as the name:
+#
+#     giya geya gia gya jiya jia jeya giyah giyya geeya guia jiyaa ...
+#
+# It does NOT match "ga", "gaya", "idea", "via", "again", "garden": the
+# middle i/e/y sound is required and the word must be exactly this shape.
+_NAME_SHAPE = re.compile(
+    r'^(?:g|j|gh|gu)(?:(?:i|e|ee|ie|ii|ea|ei)y*|y+)(?:a|aa|ah|aah)$')
+
+# Word-boundary matching. The old version used `w in text`, so a single-syllable
+# variant like "gia" matched inside "Nigeria" or "logical". Requiring whole
+# words removes a whole class of false triggers at no cost.
+_WAKE_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(w) for w in sorted(WAKE_WORDS, key=len,
+                                                   reverse=True)) + r')\b')
+
+
+def _extra_wake_words():
+    """Spellings added in settings.json -> "wake_words_extra": [...]
+    Read each time, so adding one needs no restart."""
+    try:
+        from settings import load_settings
+        return {str(w).strip().lower()
+                for w in load_settings().get("wake_words_extra", []) if w}
+    except Exception:
+        return set()
+
+
 def is_wake_word(text: str) -> bool:
-    text = text.lower().strip()
-    for w in WAKE_WORDS:
-        if w in text:
-            return True
-    return False
+    t = (text or "").lower().strip()
+    if not t:
+        return False
+    if _WAKE_RE.search(t):
+        return True
+    words = re.findall(r"[a-z]+", t)
+    if any(_NAME_SHAPE.match(w) for w in words):
+        return True
+    extra = _extra_wake_words()
+    if extra and (set(words) & extra or any(e in t for e in extra if " " in e)):
+        return True
+    # Single-word utterances only — see the note above.
+    return len(words) == 1 and words[0] in WAKE_WORDS_ALONE
+
+
+def log_near_miss(text: str):
+    """Print words that SOUND close to Giya but did not wake her.
+
+    After testing, run:   journalctl -u piassistant | grep "near miss"
+    If a word there is what Whisper wrote when you said "Giya", add it to
+    "wake_words_extra" in settings.json. No code change, no restart.
+    """
+    for w in re.findall(r"[a-z]+", (text or "").lower()):
+        if len(w) < 3:
+            continue
+        r = difflib.SequenceMatcher(None, w, "giya").ratio()
+        if r >= 0.6:
+            print(f"[WAKE] near miss: {w!r} in {text!r} (similarity {r:.2f})")
+
+
+# Whisper's stock inventions on silence. Without this, "you" or "thank you"
+# from an empty room reaches the "hi" branch below and Giya announces
+# "Please look at the camera" to nobody.
+#
+# "yeah" is NOT in this set any more. It was in both this set and the wake
+# list, and is_noise() ran FIRST in the listening loop — so a bare "yeah" was
+# discarded as a hallucination before the wake check ever saw it, and never
+# appeared in the journal at all. That is why 'gia' woke her and 'yeah' never
+# did. The loop below now checks the wake word first, which is the ordering
+# this set always assumed.
+_NOISE = {"", ".", "you", "thank you", "thanks", "okay", "ok", "oh", "hmm",
+          "uh", "um", "bye", "hello", "hi", "so", "the",
+          "thanks for watching", "subs by", "subscribe"}
+
+
+def is_noise(text: str) -> bool:
+    t = (text or "").strip().lower().rstrip(".!?,")
+    return t in _NOISE
+
 
 # ── Eye helper ─────────────────────────────────────────────
 def set_eye(state):
@@ -62,24 +147,45 @@ def set_eye(state):
         set_state(state)
     except: pass
 
-# ── Transcribe worker (runs in child process) ──────────────
-def _transcribe_worker(wav_path, result_queue):
-    try:
-        from faster_whisper import WhisperModel
-        m = WhisperModel("tiny", device="cpu", compute_type="int8")
-        segments, _ = m.transcribe(wav_path, language="en")
-        text = " ".join([s.text for s in segments]).lower().strip()
-        text = text.replace(".", "").replace(",", "").replace("!", "").replace("?", "")
-        result_queue.put(text.strip())
-    except Exception as e:
-        print(f"[STT] Worker error: {e}")
-        result_queue.put("")
-    finally:
-        try:
-            os.remove(wav_path)
-        except: pass
 
-# ── Transcribe (isolates ctranslate2 in child process) ─────
+# ══════════════════════════════════════════════════════════════════════
+# SPEECH TO TEXT
+#
+# The model is loaded ONCE, at first use, and reused.
+#
+# The previous version forked a fresh process and reloaded Whisper for every
+# single utterance. On a Pi 5 that load is the 15-second gap that showed up in
+# the log between "[MIC] Saved" and the next "[MIC] Recording":
+#
+#     11:32:53  Recording 3s
+#     11:32:56  Saved
+#     11:33:11  Heard: ''        <- 15 seconds later
+#     11:33:11  Recording 3s
+#
+# So Giya was listening for 3 seconds out of every 18 — about 17% of the time.
+# Anything said in the other 15 seconds was never recorded at all. The mic, the
+# gain and the model were all fine; the robot simply was not listening when
+# people spoke.
+#
+# The fork was presumably there to isolate a ctranslate2 crash. That is a real
+# risk, but paying 15 seconds per utterance to avoid it makes the robot
+# unusable — and a crash would now be visible in the log rather than silent.
+# ══════════════════════════════════════════════════════════════════════
+
+# The model lives in a SEPARATE, LONG-LIVED process — see whisper_worker.py.
+#
+# This robot segfaults inside faster-whisper: SIGSEGV in native code, which no
+# try/except can catch. The original code forked a child per utterance and so
+# never saw it — the child crashed, the parent got "" back, and the symptom
+# was "[STT] Heard: ''" every time with a 15-second delay. Those were one
+# cause: the delay was the model reloading on each fork, the empty results
+# were the crash.
+#
+# Neither of the obvious structures works. Fork-per-utterance isolates the
+# crash but reloads the model constantly; running in-process keeps the model
+# warm but one crash kills the service. A persistent worker does both.
+
+
 def transcribe(wav_path: str) -> str:
     if not wav_path or not os.path.exists(wav_path):
         return ""
@@ -87,27 +193,9 @@ def transcribe(wav_path: str) -> str:
         try: os.remove(wav_path)
         except: pass
         return ""
-    try:
-        result_queue = multiprocessing.Queue()
-        p = multiprocessing.Process(
-            target=_transcribe_worker,
-            args=(wav_path, result_queue),
-            daemon=True
-        )
-        p.start()
-        p.join(timeout=15)
-        if p.is_alive():
-            p.terminate()
-            p.join(timeout=2)
-            try: os.remove(wav_path)
-            except: pass
-            return ""
-        if not result_queue.empty():
-            return result_queue.get()
-        return ""
-    except Exception as e:
-        print(f"[STT] Transcribe error: {e}")
-        return ""
+    from whisper_worker import transcribe as _t
+    return _t(wav_path)
+
 
 # ── Q&A mode ───────────────────────────────────────────────
 def qa_mode():
@@ -119,7 +207,7 @@ def qa_mode():
     wav_q = record_audio(duration=5)
     question = transcribe(wav_q)
     print(f"[QUESTION] {question!r}")
-    if not question:
+    if not question or is_noise(question):
         set_eye("speaking")
         speak("I did not catch that.")
         set_eye("idle")
@@ -138,6 +226,7 @@ def qa_mode():
         speak(answer)
     set_eye("idle")
 
+
 # ── Face mode ──────────────────────────────────────────────
 def face_mode():
     print("[MODE] Face detection mode activated")
@@ -154,6 +243,7 @@ def face_mode():
     except Exception as e:
         print(f"[FACE] Error: {e}")
     set_eye("idle")
+
 
 # ── Shutdown ───────────────────────────────────────────────
 def do_shutdown():
@@ -180,13 +270,34 @@ def do_shutdown():
         print(f"[SHUTDOWN] Home error: {e}")
     try:
         send_to_esp32("LATCH:OFF")
-        print("[SHUTDOWN] LATCH:OFF sent — ESP32 cuts power in 15s")
+        print("[SHUTDOWN] LATCH:OFF sent - ESP32 cuts power in 15s")
         time.sleep(1)
     except Exception as e:
         print(f"[SHUTDOWN] Latch error: {e}")
+
+    try:
+        import whisper_worker
+        whisper_worker.stop()
+    except Exception:
+        pass
+
     print("[SHUTDOWN] Executing poweroff")
-    subprocess.Popen(["bash", "-c", "sleep 2 && sudo /sbin/shutdown -h now"])
-    os._exit(0)
+    # Call shutdown DIRECTLY.
+    #
+    # The previous version did:
+    #     subprocess.Popen(["bash","-c","sleep 2 && sudo /sbin/shutdown -h now"])
+    #     os._exit(0)
+    # That does not work under systemd. os._exit kills this process, systemd
+    # then tears down the whole cgroup by default, and the "sleep 2" child dies
+    # before it ever runs. The journal showed exactly that: "Deactivated
+    # successfully" followed by "Scheduled restart job"  the service simply
+    # came back, while the ESP32 cut power 15 seconds later on a machine that
+    # had never shut down. Every button press was a hard power cut.
+    #
+    # `shutdown -h now` hands off to systemd and returns immediately, so this
+    # does not block the caller either.
+    subprocess.run(["sudo", "/sbin/shutdown", "-h", "now"])
+
 
 # ── Factory Reset ──────────────────────────────────────────
 def do_factory_reset():
@@ -202,6 +313,7 @@ def do_factory_reset():
         "welcome_speech":  f"Hello, I am {FACTORY_ROBOT_NAME}, your robot assistant",
         "language":        "en",
         "voice":           "female",
+        "volume":          80,
         "chatgpt_enabled": True
     })
     print("[FACTORY] settings.json reset")
@@ -209,15 +321,26 @@ def do_factory_reset():
     save_qa({})
     print("[FACTORY] qa_store.json cleared")
 
+    # Hotspot connections only. It used to delete EVERY WiFi connection -
+    # including the internet one on the internal WiFi - and rebuild the
+    # hotspot on wlan0, undoing the internet/hotspot split.
+    ap_iface = os.environ.get("AP_IFACE") or (
+        "wlan1" if os.path.exists("/sys/class/net/wlan1") else "wlan0")
     try:
         result = subprocess.run(
             ['sudo', 'nmcli', '-t', '-f', 'NAME,TYPE', 'connection', 'show'],
             capture_output=True, text=True
         )
         for line in result.stdout.splitlines():
-            if ':wifi' in line:
-                conn_name = line.split(':')[0]
-                print(f"[FACTORY] Deleting wifi connection: {conn_name}")
+            conn_name, _, ctype = line.rpartition(':')
+            if ctype not in ('802-11-wireless', 'wifi'):
+                continue
+            mode = subprocess.run(
+                ['sudo', 'nmcli', '-g', '802-11-wireless.mode',
+                 'connection', 'show', conn_name],
+                capture_output=True, text=True).stdout.strip()
+            if mode == 'ap' or conn_name == FACTORY_WIFI_SSID:
+                print(f"[FACTORY] Deleting hotspot connection: {conn_name}")
                 subprocess.run(
                     ['sudo', 'nmcli', 'connection', 'delete', conn_name],
                     capture_output=True
@@ -225,12 +348,13 @@ def do_factory_reset():
         subprocess.run([
             'sudo', 'nmcli', 'connection', 'add',
             'type', 'wifi',
-            'ifname', 'wlan0',
+            'ifname', ap_iface,
             'con-name', FACTORY_WIFI_SSID,
             'autoconnect', 'yes',
             'ssid', FACTORY_WIFI_SSID,
             '802-11-wireless.mode', 'ap',
             '802-11-wireless.band', 'bg',
+            '802-11-wireless.powersave', '2',
             'ipv4.method', 'shared',
             'ipv4.addresses', f'{FACTORY_IP}/24',
             'wifi-sec.key-mgmt', 'wpa-psk',
@@ -245,7 +369,7 @@ def do_factory_reset():
             ['sudo', 'nmcli', 'connection', 'up', FACTORY_WIFI_SSID],
             capture_output=True
         )
-        print(f"[FACTORY] WiFi → '{FACTORY_WIFI_SSID}' / '{FACTORY_WIFI_PASS}' @ {FACTORY_IP}")
+        print(f"[FACTORY] WiFi -> '{FACTORY_WIFI_SSID}' / '{FACTORY_WIFI_PASS}' @ {FACTORY_IP} on {ap_iface}")
     except Exception as e:
         print(f"[FACTORY] WiFi reset error: {e}")
 
@@ -254,9 +378,10 @@ def do_factory_reset():
         speak(f"Factory reset complete. Connect to WiFi {FACTORY_WIFI_SSID} with password {FACTORY_WIFI_PASS}.")
     except: pass
 
-    print("[FACTORY] Done — restarting service")
+    print("[FACTORY] Done - restarting service")
     time.sleep(3)
     subprocess.run(['sudo', 'systemctl', 'restart', 'piassistant'])
+
 
 # ── Joystick ───────────────────────────────────────────────
 def get_direction():
@@ -267,6 +392,7 @@ def get_direction():
     if abs(x) >= DEADZONE:
         return "left" if x < -DEADZONE else "right"
     return "stop"
+
 
 def joystick_loop():
     global joy_dir, joy_speed
@@ -374,7 +500,7 @@ def joystick_loop():
                         set_eye("idle")
 
             js.close()
-            print("[JOY] Joystick disconnected — retrying in 3s...")
+            print("[JOY] Joystick disconnected - retrying in 3s...")
 
         except FileNotFoundError:
             pass
@@ -382,45 +508,95 @@ def joystick_loop():
             print(f"[JOY] Error: {e}")
         time.sleep(3)
 
+
 # ── Voice listening loop ───────────────────────────────────
 def listening_loop():
+    # Start the speech worker BEFORE the first recording, so the load time is
+    # not paid on top of the first utterance — the very first thing anybody
+    # says to the robot is otherwise the one thing it misses.
+    try:
+        import whisper_worker
+        whisper_worker.start()
+    except Exception as e:
+        print(f"[STT] worker could not start: {e}")
+
     print("[MAIN] Giya ready. Listening for wake word...")
     set_eye("speaking")
     speak("Hello, I am Giya, your robot assistant.")
     set_eye("idle")
 
+    # The speech worker was already started above, so the model is warm.
+
     while True:
         if shutdown_in_progress:
-            print("[MAIN] Shutdown in progress — stopping listening loop")
+            print("[MAIN] Shutdown in progress - stopping listening loop")
             break
 
+        rec_started = time.monotonic()
         wav = record_audio(duration=3)
 
         if shutdown_in_progress:
-            print("[MAIN] Shutdown in progress — skipping transcribe")
+            print("[MAIN] Shutdown in progress - skipping transcribe")
             try: os.remove(wav)
             except: pass
             break
+
+        if wav is None:
+            # No mic available. Back off rather than spinning on it — without
+            # this, a missing mic produces hundreds of log lines a second.
+            time.sleep(2)
+            continue
 
         text = transcribe(wav)
 
         if shutdown_in_progress:
             break
 
+        if not text:
+            time.sleep(0.1)
+            continue
+
+        # Log EVERYTHING that came back, including what will be discarded as
+        # noise a moment later. This is how you find out what Whisper actually
+        # produces when somebody says "Giya" — grep the journal for [STT] and
+        # add the real variants to WAKE_WORDS rather than guessing at them.
         print(f"[STT] Heard: {text!r}")
+
+        # The wake check runs FIRST, before is_noise(). Several plausible
+        # mistranscriptions of the name are also words Whisper hallucinates on
+        # silence, and whichever check runs first wins. Missing a wake word is
+        # the worse failure: the robot looks broken. A stray wake is one
+        # unnecessary "Yes?".
+        # Giya was talking while this was recorded (welcome greeting, app
+        # announcement...). The mic heard HER - including her own name in
+        # "Hello, I am Giya" - so the recording is not a person speaking.
+        if spoke_since(rec_started):
+            print("[STT] ignored - recorded while Giya was speaking")
+            continue
 
         if is_wake_word(text):
             print(f"[MAIN] Wake word detected in: {text!r}")
             qa_mode()
-        elif "hi" in text.split() or text.startswith("hi"):
+        elif is_noise(text):
+            time.sleep(0.1)
+            continue
+        elif re.search(r'\b(hi|hello)\s+giya\b', text) or "who am i" in text:
+            # Was: `"hi" in text.split() or text.startswith("hi")`. Whisper
+            # emits a bare "Hi." on silence, so face mode fired at random and
+            # Giya told an empty room to look at the camera.
             print("[MAIN] Face mode trigger!")
             face_mode()
+        else:
+            log_near_miss(text)
 
         time.sleep(0.1)
 
+
 # ── Entry point ────────────────────────────────────────────
 if __name__ == "__main__":
-    multiprocessing.set_start_method('fork')
+    # multiprocessing.set_start_method('fork') removed with the worker.
+    # Nothing forks now, and fork() after native libraries are loaded is
+    # unpredictable anyway.
 
     server_thread = threading.Thread(target=start_server, daemon=True)
     server_thread.start()

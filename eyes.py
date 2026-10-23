@@ -1,6 +1,9 @@
-
-import sys
-sys.path.insert(0, "/home/ben/pi_assistant/venv/lib/python3.13/site-packages")
+import sys, os, glob
+# Use the project venv's packages when present (older installs run the system
+# python3). Globbed, so it works on any Python version and any username.
+for _sp in glob.glob(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "venv", "lib", "python3*", "site-packages")):
+    sys.path.insert(0, _sp)
 import board
 import neopixel
 import threading
@@ -10,11 +13,59 @@ import math
 NUM_LEDS   = 9
 BRIGHTNESS = 0.3
 
-left_eye  = neopixel.NeoPixel(board.D24, NUM_LEDS, brightness=BRIGHTNESS, auto_write=False)
+left_eye  = neopixel.NeoPixel(board.D12, NUM_LEDS, brightness=BRIGHTNESS, auto_write=False)
 right_eye = neopixel.NeoPixel(board.D10, NUM_LEDS, brightness=BRIGHTNESS, auto_write=False)
 
 _state   = "idle"
 _step    = 0
+
+# App connection shown in the RESTING colour: whenever the eyes are idle they
+# breathe ORANGE until the phone app connects, BLUE while it is connected.
+# Every other state (listening, speaking, ...) still shows as before and then
+# returns to idle, which picks up the right colour by itself.
+_app_connected = False
+
+
+# Resting colour while the app is connected. The app's colour slider sets it
+# (GET /eyes/color?r=&g=&b=). Saved in settings.json as "eye_color", so the
+# chosen colour comes back after a reboot. Blue until someone picks one.
+DEFAULT_EYE_COLOR = (0, 0, 255)
+_idle_color = DEFAULT_EYE_COLOR
+
+
+def _load_saved_color():
+    global _idle_color
+    try:
+        from settings import load_settings
+        c = load_settings().get("eye_color")
+        if isinstance(c, (list, tuple)) and len(c) == 3:
+            _idle_color = tuple(max(0, min(255, int(v))) for v in c)
+    except Exception as e:
+        print(f"[EYES] could not load saved colour: {e}")
+
+
+def set_color(r, g, b):
+    """New colour from the app slider. Only the breathing-blue patterns use
+    it (idle while the app is connected, and eyes1). Every other pattern is
+    left exactly as it was."""
+    global _idle_color
+    _idle_color = (max(0, min(255, int(r))),
+                   max(0, min(255, int(g))),
+                   max(0, min(255, int(b))))
+    return _idle_color
+
+
+def get_color():
+    return _idle_color
+
+
+def set_app_connected(connected):
+    global _app_connected
+    connected = bool(connected)
+    if connected != _app_connected:
+        _app_connected = connected
+        print(f"[EYES] app {'connected - slider colour' if connected else 'not connected - orange'}")
+
 _running = False
 _thread  = None
 
@@ -34,12 +85,17 @@ def _eye_loop():
         try:
             if s == "idle":
                 val = int((1 + math.sin(_step * 0.1)) * 60)
-                _show((0, 0, max(5, val)))
+                if _app_connected:
+                    k = max(0.05, val / 120)          # same breathing as before
+                    _show(tuple(int(c * k) for c in _idle_color))  # slider colour
+                else:
+                    _show((max(5, val * 2), max(2, int(val * 0.7)), 0))  # orange
                 time.sleep(0.05)
 
             elif s == "eyes1":
                 val = int((1 + math.sin(_step * 0.06)) * 80)
-                _show((0, 0, max(5, val)))
+                k = max(0.03, val / 160)
+                _show(tuple(int(c * k) for c in _idle_color))  # slider colour
                 time.sleep(0.05)
 
             elif s == "eyes2":
@@ -133,6 +189,7 @@ def set_state(state):
 
 def start_eyes():
     global _running, _thread
+    _load_saved_color()
     _running = True
     _thread  = threading.Thread(target=_eye_loop, daemon=True)
     _thread.start()
