@@ -1,7 +1,7 @@
 # Giya Robot — Complete Setup Guide
 
 ## Overview
-Giya is an AI-powered humanoid robot built on Raspberry Pi 5 with ESP32 WROOM for motor and servo control, TF-Luna LiDAR for obstacle and person detection, INMP441 microphone for voice input, and WS2812 LED eyes.
+Giya is an AI-powered humanoid robot built on Raspberry Pi 5 with an ESP32-S3 for motor, servo and power control, TF-Luna LiDAR for obstacle and person detection, a wireless lavalier mic (INMP441 as fallback) for voice input, and WS2812 LED eyes.
 
 ---
 
@@ -11,33 +11,55 @@ Giya is an AI-powered humanoid robot built on Raspberry Pi 5 with ESP32 WROOM fo
 |-----------|--------------|
 | Raspberry Pi 5 | 8GB RAM |
 | MicroSD Card | 64GB Class 10 |
-| ESP32 WROOM | CP2102 USB chip |
+| ESP32-S3 | DevKit (motors, servos, TF-Luna, power latch) |
 | Servo Motor | MG996R x2 (Forearm L/R) |
-| Motor Driver | BTN7960 / IBT-2 |
+| Motor Driver | BTS7960 / IBT-2 x2 |
 | Distance Sensor | TF-Luna LiDAR (I2C mode) |
-| Microphone | INMP441 (I2S) |
-| Speaker | USB Soundcard |
+| Microphone | Wireless lav USB receiver (4c4a:4155), INMP441 (I2S) fallback |
+| Speaker | USB soundcard (PCM2902, 08bb:2902) |
+| WiFi dongle | USB WiFi adapter on wlan1 for the GiyaRobot hotspot |
+| Power switch | Latching power circuit held by the ESP32 + momentary push button |
 | LED Eyes | WS2812 NeoPixel Ring x2 (9 LEDs each) |
 | Power Supply | 5V 10A external (motors and servos) |
 
 ---
 
-## ESP32 WROOM Pin Map
+## ESP32-S3 Pin Map
 
-| GPIO | Function |
-|------|----------|
-| 27 | RPWM_L Left Motor Forward |
-| 25 | LPWM_L Left Motor Backward |
-| 13 | RPWM_R Right Motor Forward |
-| 15 | LPWM_R Right Motor Backward |
-| 26 | EN_L Left Motor Enable |
-| 14 | EN_R Right Motor Enable |
-| 32 | Servo Left Forearm |
-| 33 | Servo Right Forearm |
-| 21 | SDA TF-Luna I2C |
-| 22 | SCL TF-Luna I2C |
-| 16 | RX2 Pi Serial TX |
-| 17 | TX2 Pi Serial RX |
+Matches `Arduino/final_giya_firmware.ino`.
+
+| GPIO | Function | Connects to |
+|------|----------|-------------|
+| 10 | RPWM_L Left motor forward | Left BTS7960 RPWM |
+| 9  | LPWM_L Left motor backward | Left BTS7960 LPWM |
+| 3  | EN_L Left motor enable | Left BTS7960 R_EN + L_EN |
+| 13 | RPWM_R Right motor forward | Right BTS7960 RPWM |
+| 12 | LPWM_R Right motor backward | Right BTS7960 LPWM |
+| 11 | EN_R Right motor enable | Right BTS7960 R_EN + L_EN |
+| 6  | Servo left forearm | MG996R signal |
+| 7  | Servo right forearm | MG996R signal |
+| 14 | SDA, I2C | TF-Luna SDA |
+| 21 | SCL, I2C | TF-Luna SCL |
+| 18 | UART2 RX | Pi TX, GPIO 14 (physical pin 8) |
+| 17 | UART2 TX | Pi RX, GPIO 15 (physical pin 10) |
+| 35 | LATCH, HIGH holds the power on | Power latch circuit |
+| 15 | Shutdown button (INPUT_PULLDOWN, pressed = HIGH) | Push button to 3.3V |
+
+Notes:
+- **GND** of the ESP32, Pi, motor drivers and TF-Luna must all be connected.
+- **TF-Luna** must be in I2C mode (address `0x10`).
+- **Serial** runs at 115200 baud. ESP32 TX goes to Pi RX and ESP32 RX to Pi TX; they cross over.
+- **GPIO 35:** on ESP32-S3 modules with octal PSRAM (N8R8 / N16R8), GPIO 35–37 are used by the PSRAM. If the latch misbehaves on such a module, move it to a free pin and change `LATCH_PIN`.
+
+### Power button and latch
+
+| Action | What happens |
+|--------|--------------|
+| Short press (robot off) | Board powers up, ESP32 sets GPIO 35 HIGH at once and holds the power |
+| Hold 3 s (robot on) | ESP32 sends `SHUTDOWN` to the Pi, Pi says goodbye and shuts down, ESP32 cuts power 15 s later |
+| Shutdown from the app | Pi sends `LATCH:OFF`, ESP32 replies `LATCH:COUNTDOWN` and cuts power 15 s later |
+
+The press that switches the robot on is ignored as a shutdown press, so holding the button a little long at power-up does not turn it straight off again.
 
 ---
 
@@ -45,14 +67,34 @@ Giya is an AI-powered humanoid robot built on Raspberry Pi 5 with ESP32 WROOM fo
 
 | Component | Pi GPIO |
 |-----------|---------|
-| WS2812 Left Eye | GPIO 24 |
-| WS2812 Right Eye | GPIO 10 |
+| WS2812 Left Eye (data) | GPIO 12 |
+| WS2812 Right Eye (data) | GPIO 10 |
 | INMP441 SD | GPIO 20 |
 | INMP441 WS | GPIO 19 |
 | INMP441 SCK | GPIO 18 |
 | INMP441 L/R | GND |
-| ESP32 TX (pin 17) | Pi RX ttyAMA0 |
-| ESP32 RX (pin 16) | Pi TX ttyAMA0 |
+| ESP32 TX (GPIO 17) | GPIO 15 RX, ttyAMA0 (pin 10) |
+| ESP32 RX (GPIO 18) | GPIO 14 TX, ttyAMA0 (pin 8) |
+
+Eye pins are set in `eyes.py` (`board.D12`, `board.D10`).
+
+### Network
+
+| Interface | Role |
+|-----------|------|
+| wlan1 (USB dongle) | GiyaRobot hotspot, 192.168.4.1. The phone app connects here |
+| wlan0 (built-in) | Internet WiFi. Changed from the app (Settings → WiFi) |
+
+### Eyes
+
+| Colour | Meaning |
+|--------|---------|
+| Breathing orange | App not connected |
+| Breathing blue (or the colour picked with the app's slider) | App connected |
+| Green | Listening |
+| Cyan | Speaking |
+| Orange flashing | Thinking |
+| Red flashing | Obstacle / shutting down |
 
 ---
 
@@ -225,8 +267,8 @@ sudo journalctl -u piassistant -f
 2. Add ESP32 board URL in Preferences:https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
 3. Board Manager → install ESP32 by Espressif
 4. Library Manager → install ESP32Servo
-5. Open esp32/giya_esp32.ino
-6. Board: ESP32 Dev Module
+5. Open Arduino/final_giya_firmware.ino
+6. Board: ESP32S3 Dev Module
 7. Upload
 
 ---
@@ -265,12 +307,17 @@ Expected:
 | /qa/add | POST | Add Q&A pair |
 | /qa/delete | POST | Delete Q&A |
 | /move | GET | Motor control (dir=forward/backward/left/right/stop) |
-| /speed | GET | Motor speed (value=0-100) |
+| /speed | GET | Motor speed (value=0-200, 0 = stop) |
 | /position | GET | Servo position (part=forearm, value=0-2000, hand=left/right/both) |
 | /home | GET | Home servos |
 | /eyes1 | GET | Eye mode 1 calm blue |
 | /eyes2 | GET | Eye mode 2 heartbeat |
 | /eyes3 | GET | Eye mode 3 rainbow |
+| /eyes/color | GET | Breathing eye colour (r, g, b = 0-255), saved across reboots |
+| /settings | GET | Settings; also volume=, and wifi_ssid= + wifi_password= to change the internet WiFi |
+| /control/acquire | POST | App takes control (one app at a time); returns session_id |
+| /control/heartbeat | POST | Keeps the app's session alive |
+| /control/release | POST | App gives up control |
 | /shutdown | GET | Safe shutdown |
 | /restart | GET | Reboot Pi |
 
@@ -279,6 +326,8 @@ Expected:
 ## Wake Word
 
 - Say robot name (default: **Giya**) to activate Q&A mode
+- Common mishearings (geeya, jiya, gia, Gaia...) also wake her
+- To add another spelling, put it in `settings.json` under `"wake_words_extra": ["word"]`. No restart needed. Words that nearly matched are logged: `journalctl -u piassistant | grep "near miss"`
 - Say **hi** to activate face recognition mode
 - Robot name can be changed via app
 
@@ -292,9 +341,11 @@ Expected:
 | Mic not recording | Check INMP441 wiring. Run arecord -l |
 | ESP32 not connecting | Check /dev/ttyAMA0. Enable serial in raspi-config |
 | Wake word not working | Check settings.json robot_name |
-| Motors not moving | Check EN pins HIGH. Check power supply |
+| Motors not moving | Check EN pins (GPIO 3, 11) go HIGH. Check power supply |
+| ESP32 not answering | TX/RX crossed? ESP32 GPIO 17 to Pi GPIO 15, ESP32 GPIO 18 to Pi GPIO 14 |
+| Robot switches off when the button is released | Latch not holding: check the GPIO 35 to latch circuit |
 | Service not starting | Run sudo journalctl -u piassistant -n 50 |
-| TF-Luna not detecting | Check I2C wiring SDA=21 SCL=22 on ESP32 |
+| TF-Luna not detecting | Check I2C wiring SDA=14 SCL=21 on ESP32-S3 |
 | Eyes not working | Run pip install rpi-lgpio in venv |
 
 ---
